@@ -7,6 +7,7 @@ Locked candidate-generation architecture:
 Candidate UNION: Combines candidates from all three retrieval channels.
 """
 
+import heapq
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
@@ -15,9 +16,15 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 try:
-    from src.config import CHAR_TFIDF_TOP_K
+    from src.config import (
+        CHAR_TFIDF_TOP_K,
+        WORD_NGRAM_RANGE,
+        WORD_TFIDF_TOP_K,
+    )
 except ImportError:
     CHAR_TFIDF_TOP_K = 20
+    WORD_TFIDF_TOP_K = 20
+    WORD_NGRAM_RANGE = (1, 2)
 
 from src.preprocess import normalize_name
 
@@ -250,14 +257,174 @@ def retrieve_char_tfidf_candidates(
 
 def retrieve_word_tfidf_candidates(
     s1_df: pd.DataFrame,
-    target_df: pd.DataFrame,
-    top_k: int = 20
-) -> Dict[str, Set[str]]:
+    target_df: Union[pd.DataFrame, List[pd.DataFrame]],
+    top_k: int = WORD_TFIDF_TOP_K,
+    ngram_range: Tuple[int, int] = WORD_NGRAM_RANGE,
+    chunk_size: int = 500,
+    min_similarity: float = 0.0,
+    return_scores: bool = False,
+    min_df: int = 1,
+) -> Union[Dict[str, Set[str]], Dict[str, Dict[str, float]]]:
     """Retrieve candidate target IDs for each S1 entity using Word n-gram TF-IDF similarity.
 
-    To be implemented during future pipeline task.
+    Memory-safe for multi-million-row target datasets:
+    1. Uses word n-grams (default: (1, 2)) to capture whole-word token matches and word bigrams.
+    2. Uses float32 TF-IDF matrix representation to cut memory by 50%.
+    3. Keeps sparse TF-IDF matrices; never calls toarray() or todense().
+    4. Retains chunked S1 query vectorization for efficient batch string transforms.
+    5. Computes similarity row-by-row against precomputed transposed target matrix (X_target_T).
+    6. Discards intermediate row similarities immediately after extracting Top-K candidates.
+    7. Explicitly ensures CSR format for row-wise Top-K extraction.
+    8. Handles duplicate target entity IDs by aggregating maximum similarity scores across
+       all occurrences without premature stopping.
+    9. Enforces deterministic tie-breaking using candidate entity_id as the secondary key.
+    10. Handles missing, null, or empty business names gracefully.
+
+    Parameters
+    ----------
+    s1_df : pd.DataFrame
+        Source 1 query DataFrame containing 'entity_id' and 'business_name' or 'name_normalized'.
+    target_df : Union[pd.DataFrame, List[pd.DataFrame]]
+        Target candidate DataFrame (or list of DataFrames for Source 2 and Source 3)
+        containing 'entity_id' and 'business_name' or 'name_normalized'.
+    top_k : int
+        Maximum number of candidates to retrieve per S1 entity.
+    ngram_range : Tuple[int, int]
+        Word n-gram range for TF-IDF (defaults to (1, 2)).
+    chunk_size : int
+        Number of S1 query records processed per batch to bound memory usage.
+    min_similarity : float
+        Minimum cosine similarity threshold to consider a candidate.
+    return_scores : bool
+        If True, returns Dict[s1_id, Dict[cand_id, score]].
+        If False, returns Dict[s1_id, Set[cand_id]].
+    min_df : int
+        Minimum document frequency for word n-grams. Defaults to 1.
+        In entity resolution blocking, min_df=1 is strictly appropriate to preserve
+        rare brand names, distinctive word tokens, and unique entity identifiers.
+
+    Returns
+    -------
+    Union[Dict[str, Set[str]], Dict[str, Dict[str, float]]]
+        Mapping from source1_entity_id to candidate entity IDs (preserving S2- and S3- prefixes).
     """
-    raise NotImplementedError("Word TF-IDF retrieval will be implemented in a subsequent task.")
+    if "entity_id" not in s1_df.columns:
+        raise ValueError("s1_df must contain 'entity_id' column.")
+
+    # Combine target dataframes if provided as a list
+    if isinstance(target_df, list):
+        target_df = pd.concat(target_df, ignore_index=True)
+
+    if "entity_id" not in target_df.columns:
+        raise ValueError("target_df must contain 'entity_id' column.")
+
+    target_ids = target_df["entity_id"].astype(str).tolist()
+    target_names = _extract_normalized_names(target_df)
+
+    n_targets = len(target_names)
+    if n_targets == 0:
+        return {str(sid): ({} if return_scores else set()) for sid in s1_df["entity_id"]}
+
+    has_duplicate_targets = len(target_ids) != len(set(target_ids))
+
+    # Fit Word TF-IDF on target candidate corpus with float32 dtype to halve memory usage
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        ngram_range=ngram_range,
+        token_pattern=r"(?u)\b\w+\b",
+        sublinear_tf=True,
+        min_df=min_df,
+        dtype=np.float32,
+    )
+
+    try:
+        X_target = vectorizer.fit_transform(target_names)
+    except ValueError as e:
+        # Handle degenerate case where target documents contain no valid word tokens
+        if "empty vocabulary" in str(e).lower():
+            return {str(sid): ({} if return_scores else set()) for sid in s1_df["entity_id"]}
+        raise
+
+    if not isinstance(X_target, sp.csr_matrix):
+        X_target = X_target.tocsr()
+
+    # Precompute transpose once.
+    X_target_T = X_target.T.tocsr()
+
+    # Process S1 queries in chunks to bound memory
+    s1_ids = s1_df["entity_id"].astype(str).tolist()
+    s1_names = _extract_normalized_names(s1_df)
+    n_s1 = len(s1_ids)
+
+    candidates: Dict[str, Union[Set[str], Dict[str, float]]] = {}
+
+    for start_idx in range(0, n_s1, chunk_size):
+        end_idx = min(start_idx + chunk_size, n_s1)
+        chunk_texts = s1_names[start_idx:end_idx]
+        chunk_ids = s1_ids[start_idx:end_idx]
+
+        # Chunked sparse query vectorization
+        X_chunk = vectorizer.transform(chunk_texts)
+        if not isinstance(X_chunk, sp.csr_matrix):
+            X_chunk = X_chunk.tocsr()
+
+        for i, s1_id in enumerate(chunk_ids):
+            if top_k <= 0:
+                candidates[s1_id] = {} if return_scores else set()
+                continue
+
+            q_vec = X_chunk[i : i + 1]  # 1 x D CSR vector
+
+            if q_vec.nnz == 0:
+                candidates[s1_id] = {} if return_scores else set()
+                continue
+
+            # Sparse dot product for single query row against transposed target matrix
+            row_sims = q_vec.dot(X_target_T)
+            # Explicitly ensure CSR format for documented row-wise array extraction
+            if not isinstance(row_sims, sp.csr_matrix):
+                row_sims = row_sims.tocsr()
+
+            if row_sims.nnz == 0:
+                candidates[s1_id] = {} if return_scores else set()
+                continue
+
+            cols = row_sims.indices
+            data = row_sims.data
+
+            if min_similarity > 0.0:
+                mask = data >= min_similarity
+                cols = cols[mask]
+                data = data[mask]
+                if len(data) == 0:
+                    candidates[s1_id] = {} if return_scores else set()
+                    continue
+
+            # Aggregate scores if duplicate target IDs exist
+            if has_duplicate_targets:
+                entity_best_scores: Dict[str, float] = {}
+                for col, score in zip(cols, data):
+                    cid = target_ids[col]
+                    s = float(score)
+                    if cid not in entity_best_scores or s > entity_best_scores[cid]:
+                        entity_best_scores[cid] = s
+                items = list(entity_best_scores.items())
+            else:
+                items = [(target_ids[col], float(score)) for col, score in zip(cols, data)]
+
+            # Deterministic selection: primary key -score (descending), secondary key cid (ascending)
+            if len(items) <= top_k:
+                best = sorted(items, key=lambda x: (-x[1], x[0]))
+            else:
+                best = heapq.nsmallest(top_k, items, key=lambda x: (-x[1], x[0]))
+
+            if return_scores:
+                candidates[s1_id] = {cid: score for cid, score in best}
+            else:
+                candidates[s1_id] = {cid for cid, _ in best}
+
+    return candidates
+
 
 
 def union_candidates(

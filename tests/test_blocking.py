@@ -602,11 +602,343 @@ def test_explicit_csr_format_ensured():
 
 
 # ============================================================================
-# 22. Word TF-IDF Placeholder (Architecture Guard)
+# 22. Word TF-IDF Normal Retrieval (Word Tokens & Bigrams)
 # ============================================================================
 
-def test_word_tfidf_raises_not_implemented():
-    """Verify word TF-IDF retrieval placeholder raises NotImplementedError as scheduled."""
-    with pytest.raises(NotImplementedError):
-        retrieve_word_tfidf_candidates(pd.DataFrame(), pd.DataFrame())
+def test_word_tfidf_normal_retrieval():
+    """Verify Word TF-IDF retrieval captures whole-word token matches and word bigrams."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001", "S1-002"],
+        "business_name": [
+            "Summit Health Care Group",
+            "Pioneer Global Logistics Services",
+        ]
+    })
 
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-101", "S3-202", "S2-303"],
+        "business_name": [
+            "Summit Health Care Clinic",               # shares 'summit health', 'health care'
+            "Pioneer Global Logistics",                # shares 'pioneer global', 'global logistics'
+            "Omega Bakery & Cafe",                     # 0 word overlap
+        ]
+    })
+
+    candidates = retrieve_word_tfidf_candidates(s1_df, target_df, top_k=5)
+
+    assert "S2-101" in candidates["S1-001"]
+    assert "S2-303" not in candidates["S1-001"]
+    assert "S3-202" in candidates["S1-002"]
+    assert "S2-303" not in candidates["S1-002"]
+
+
+# ============================================================================
+# 23. Word TF-IDF Top-K Limit Respected
+# ============================================================================
+
+def test_word_tfidf_top_k_respected():
+    """Verify that Word TF-IDF retrieval strictly limits candidates to top_k."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["Apex Logistics Freight Services"],
+    })
+
+    target_records = [
+        {"entity_id": f"S2-{i:03d}", "business_name": f"Apex Logistics Freight Branch {i}"}
+        for i in range(25)
+    ]
+    target_df = pd.DataFrame(target_records)
+
+    top_k = 5
+    candidates = retrieve_word_tfidf_candidates(s1_df, target_df, top_k=top_k)
+
+    assert len(candidates["S1-001"]) == top_k
+
+
+# ============================================================================
+# 24. Word TF-IDF return_scores=True Format & Range
+# ============================================================================
+
+def test_word_tfidf_return_scores():
+    """Verify Word TF-IDF return_scores=True returns Dict[s1_id, Dict[cand_id, float_score]]."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["United Medical Health Group"],
+    })
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-001", "S3-002"],
+        "business_name": ["United Medical Group", "United Health Care"],
+    })
+
+    candidates = retrieve_word_tfidf_candidates(s1_df, target_df, top_k=5, return_scores=True)
+
+    assert isinstance(candidates, dict)
+    assert "S1-001" in candidates
+    s1_scores = candidates["S1-001"]
+    assert isinstance(s1_scores, dict)
+    assert len(s1_scores) == 2
+
+    for cand_id, score in s1_scores.items():
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0001
+
+    # Both matching candidates should have positive cosine similarity
+    assert s1_scores["S2-001"] > 0.3
+    assert s1_scores["S3-002"] > 0.2
+
+
+# ============================================================================
+# 25. Word TF-IDF min_similarity Threshold
+# ============================================================================
+
+def test_word_tfidf_min_similarity():
+    """Verify Word TF-IDF prunes candidates with cosine similarity below min_similarity."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["Global Pacific Freight Forwarding"],
+    })
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-HIGH", "S2-LOW"],
+        "business_name": [
+            "Global Pacific Freight Forwarding Inc",  # High word overlap
+            "Global Bakery Cafe",                    # Weak overlap (only 'global')
+        ]
+    })
+
+    candidates = retrieve_word_tfidf_candidates(
+        s1_df, target_df, top_k=5, min_similarity=0.6, return_scores=True
+    )
+
+    assert "S2-HIGH" in candidates["S1-001"]
+    assert "S2-LOW" not in candidates["S1-001"]
+
+
+# ============================================================================
+# 26. Word TF-IDF Empty Target DataFrame
+# ============================================================================
+
+def test_word_tfidf_empty_target():
+    """Verify Word TF-IDF gracefully handles empty target DataFrames in both modes."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001", "S1-002"],
+        "business_name": ["Acme Corp", "Beta LLC"],
+    })
+    empty_target_df = pd.DataFrame(columns=["entity_id", "business_name"])
+
+    cands_sets = retrieve_word_tfidf_candidates(s1_df, empty_target_df, return_scores=False)
+    assert cands_sets == {"S1-001": set(), "S1-002": set()}
+
+    cands_dicts = retrieve_word_tfidf_candidates(s1_df, empty_target_df, return_scores=True)
+    assert cands_dicts == {"S1-001": {}, "S1-002": {}}
+
+
+# ============================================================================
+# 27. Word TF-IDF NaN and Missing Names
+# ============================================================================
+
+def test_word_tfidf_nan_and_missing_names():
+    """Verify Word TF-IDF robustly handles None, NaN, and degenerate/empty word records."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-VALID", "S1-NAN", "S1-EMPTY"],
+        "business_name": ["Sterling Financial Advisors", None, "   "],
+    })
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-VALID", "S2-NAN", "S2-EMPTY"],
+        "business_name": ["Sterling Financial Advisors Group", np.nan, "---"],
+    })
+
+    candidates = retrieve_word_tfidf_candidates(s1_df, target_df, top_k=5)
+
+    assert "S2-VALID" in candidates["S1-VALID"]
+    assert candidates["S1-NAN"] == set()
+    assert candidates["S1-EMPTY"] == set()
+
+
+# ============================================================================
+# 28. Word TF-IDF Duplicate Target Entity IDs Preserve Best Score
+# ============================================================================
+
+def test_word_tfidf_duplicate_target_entity_ids():
+    """Verify Word TF-IDF deterministically keeps the highest score for duplicate entity IDs."""
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["Apex Global Logistics"],
+    })
+
+    # Order A: lower match first, exact match second
+    target_df_a = pd.DataFrame({
+        "entity_id": ["S2-101", "S2-101"],
+        "business_name": ["Apex", "Apex Global Logistics"],
+    })
+
+    cands_a = retrieve_word_tfidf_candidates(s1_df, target_df_a, top_k=5, return_scores=True)
+    score_a = cands_a["S1-001"]["S2-101"]
+
+    # Order B: exact match first, lower match second
+    target_df_b = pd.DataFrame({
+        "entity_id": ["S2-101", "S2-101"],
+        "business_name": ["Apex Global Logistics", "Apex"],
+    })
+
+    cands_b = retrieve_word_tfidf_candidates(s1_df, target_df_b, top_k=5, return_scores=True)
+    score_b = cands_b["S1-001"]["S2-101"]
+
+    assert pytest.approx(score_a, 0.001) == pytest.approx(score_b, 0.001)
+    assert score_a > 0.95
+
+
+# ============================================================================
+# 29. Word TF-IDF Float32 Matrix Verification
+# ============================================================================
+
+def test_word_tfidf_float32_dtype():
+    """Verify Word TF-IDF matrix uses float32 to minimize memory footprint."""
+    s1_df = pd.DataFrame({"entity_id": ["S1-01"], "business_name": ["Acme Corp"]})
+    target_df = pd.DataFrame({"entity_id": ["S2-01"], "business_name": ["Acme Corporation"]})
+
+    captured_dtypes = []
+    original_fit_transform = TfidfVectorizer.fit_transform
+
+    def spy_fit_transform(self, *args, **kwargs):
+        res = original_fit_transform(self, *args, **kwargs)
+        captured_dtypes.append(res.dtype)
+        return res
+
+    with patch.object(TfidfVectorizer, "fit_transform", spy_fit_transform):
+        retrieve_word_tfidf_candidates(s1_df, target_df)
+
+    assert len(captured_dtypes) > 0
+    assert captured_dtypes[0] == np.float32
+
+
+# ============================================================================
+# 30. Word TF-IDF No Dense NxM Matrix Created
+# ============================================================================
+
+def test_word_tfidf_no_dense_matrix_created():
+    """Verify Word TF-IDF never calls toarray() or todense() on sparse matrices."""
+    s1_df = pd.DataFrame({
+        "entity_id": [f"S1-{i}" for i in range(10)],
+        "business_name": [f"Enterprise Name {i}" for i in range(10)],
+    })
+    target_df = pd.DataFrame({
+        "entity_id": [f"S2-{j}" for j in range(30)],
+        "business_name": [f"Enterprise Target {j}" for j in range(30)],
+    })
+
+    with patch.object(sp.csr_matrix, "toarray", side_effect=AssertionError("Dense toarray() called!")):
+        with patch.object(sp.csr_matrix, "todense", side_effect=AssertionError("Dense todense() called!")):
+            candidates = retrieve_word_tfidf_candidates(s1_df, target_df, top_k=5)
+
+    assert len(candidates) == 10
+
+
+# ============================================================================
+# 31. Word TF-IDF Missing entity_id Error
+# ============================================================================
+
+def test_word_tfidf_missing_entity_id_error():
+    """Verify missing entity_id in s1_df or target_df raises ValueError."""
+    bad_s1 = pd.DataFrame({"business_name": ["Acme"]})
+    good_s1 = pd.DataFrame({"entity_id": ["S1-1"], "business_name": ["Acme"]})
+    bad_target = pd.DataFrame({"business_name": ["Acme Corp"]})
+    good_target = pd.DataFrame({"entity_id": ["S2-1"], "business_name": ["Acme Corp"]})
+
+    with pytest.raises(ValueError, match="s1_df must contain 'entity_id'"):
+        retrieve_word_tfidf_candidates(bad_s1, good_target)
+
+    with pytest.raises(ValueError, match="target_df must contain 'entity_id'"):
+        retrieve_word_tfidf_candidates(good_s1, bad_target)
+
+
+# ============================================================================
+# 32. Word TF-IDF Duplicate Target IDs: Higher-Scoring Duplicate Appears Later
+# ============================================================================
+
+def test_word_tfidf_duplicate_target_ids_higher_scoring_later():
+    """Verify duplicate target IDs retain maximum similarity score even when
+    the higher-scoring occurrence appears after initial Top-K unique IDs.
+    """
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["Alpha Beta Gamma Corporation"],
+    })
+
+    # Row 0: S2-001 with low overlap
+    # Row 1: S2-002 with medium overlap
+    # Row 2: S2-003 with medium overlap
+    # Row 3: S2-004 with medium overlap
+    # Row 4: S2-001 with exact match (score ~ 1.0)
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-001", "S2-002", "S2-003", "S2-004", "S2-001"],
+        "business_name": [
+            "Alpha",
+            "Alpha Beta",
+            "Beta Gamma",
+            "Gamma Corporation",
+            "Alpha Beta Gamma Corporation",
+        ],
+    })
+
+    # With top_k=2, the top 2 distinct entities should be S2-001 (score ~1.0) and S2-004
+    cands_scores = retrieve_word_tfidf_candidates(
+        s1_df, target_df, top_k=2, return_scores=True
+    )
+    assert "S1-001" in cands_scores
+    scores = cands_scores["S1-001"]
+    assert len(scores) == 2
+    assert "S2-001" in scores
+    # Score for S2-001 must be the maximum score (approx 1.0), not the early lower score
+    assert scores["S2-001"] > 0.95
+
+    # Also verify return_scores=False returns the set of top-2 unique candidate IDs
+    cands_set = retrieve_word_tfidf_candidates(
+        s1_df, target_df, top_k=2, return_scores=False
+    )
+    assert "S2-001" in cands_set["S1-001"]
+    assert len(cands_set["S1-001"]) == 2
+
+
+# ============================================================================
+# 33. Word TF-IDF Equal Scores & Deterministic Tie-Breaking
+# ============================================================================
+
+def test_word_tfidf_equal_scores_deterministic_tie_breaking():
+    """Verify deterministic candidate selection and ordering when multiple
+    candidates have exactly equal similarity scores, using candidate entity_id
+    as the secondary key.
+    """
+    s1_df = pd.DataFrame({
+        "entity_id": ["S1-001"],
+        "business_name": ["Pacific Logistics"],
+    })
+
+    # Multiple candidates with identical names (thus identical similarity scores = 1.0)
+    target_df = pd.DataFrame({
+        "entity_id": ["S2-ZED", "S2-MID", "S2-ABC", "S2-DEF"],
+        "business_name": ["Pacific Logistics"] * 4,
+    })
+
+    # Retrieve top_k=2 with return_scores=True
+    cands_scores = retrieve_word_tfidf_candidates(
+        s1_df, target_df, top_k=2, return_scores=True
+    )
+    result_keys = list(cands_scores["S1-001"].keys())
+
+    # Lexicographically, 'S2-ABC' < 'S2-DEF' < 'S2-MID' < 'S2-ZED'
+    # Deterministic tie-breaking must select ['S2-ABC', 'S2-DEF'] in order
+    assert result_keys == ["S2-ABC", "S2-DEF"]
+
+    # Verify return_scores=False returns the exact same top-2 candidate IDs
+    cands_set = retrieve_word_tfidf_candidates(
+        s1_df, target_df, top_k=2, return_scores=False
+    )
+    assert cands_set["S1-001"] == {"S2-ABC", "S2-DEF"}
+
+    # Verify result is deterministic across multiple repeated runs with shuffled inputs
+    for _ in range(5):
+        shuffled_target = target_df.sample(frac=1.0, random_state=None).reset_index(drop=True)
+        res = retrieve_word_tfidf_candidates(
+            s1_df, shuffled_target, top_k=2, return_scores=True
+        )
+        assert list(res["S1-001"].keys()) == ["S2-ABC", "S2-DEF"]
