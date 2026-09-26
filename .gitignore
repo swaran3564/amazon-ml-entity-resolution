@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Competition datasets - never commit real data
+dataset/train/*.tsv
+dataset/test/*.tsv
+
+# Embedding artifacts
+embeddings.npz
+*.npy
+*.npz
+
+# Generated submissions
+output/*.tsv
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
