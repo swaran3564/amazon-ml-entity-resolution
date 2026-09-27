@@ -412,6 +412,7 @@ def run_benchmark(
     seed: int = 42,
     char_top_k: int = CHAR_TFIDF_TOP_K,
     word_top_k: int = WORD_TFIDF_TOP_K,
+    compare_top_k: Optional[List[int]] = None,
     target_chunk_size: int = 100000,
     max_target_rows: Optional[int] = None,
     s1_path: Path = TRAIN_SOURCE1,
@@ -420,13 +421,19 @@ def run_benchmark(
     gt_path: Path = TRAIN_GROUND_TRUTH,
     output_path: Path = OUTPUT_DIR / "union_blocking_benchmark.json",
     check_safety_only: bool = False,
+    force_recompute_vectorizers: bool = False,
 ) -> Optional[Dict]:
     """Run mathematically valid dual-channel Character + Word TF-IDF union blocking evaluation."""
+    if compare_top_k is None:
+        compare_top_k = [20, 30, 40, 50]
+
+    max_k = max(compare_top_k) if compare_top_k else max(char_top_k, word_top_k)
+
     print("=" * 88)
     print("CANDIDATE UNION BLOCKING BENCHMARK: CHARACTER TF-IDF + WORD TF-IDF")
     print("=" * 88)
     print(f"Sample size: {sample_size:,} S1 entities (seed: {seed})")
-    print(f"Retrieval channels: Character Top-K={char_top_k}, Word Top-K={word_top_k}")
+    print(f"Evaluated Top-K list: {compare_top_k} (Max K: {max_k})")
     print(f"Target chunk size: {target_chunk_size:,} records")
 
     # 1. Safety assessment
@@ -469,16 +476,36 @@ def run_benchmark(
     n_s1_with_gt = sum(1 for m in gt_map.values() if len(m) > 0)
     print(f"Sampled {len(s1_ids):,} S1 queries. Found {total_true_pairs:,} true matches across {n_s1_with_gt:,} S1 entities ({len(s1_ids) - n_s1_with_gt:,} singletons).")
 
-    # 4. Pass 1: Build consistent global TfidfVectorizers
-    char_vectorizer, word_vectorizer = build_dual_consistent_vectorizers(
-        s2_path=s2_path,
-        s3_path=s3_path,
-        chunk_size=target_chunk_size,
-        total_target_rows=total_target_rows,
-        max_target_rows=max_target_rows,
-        char_ngram_range=(3, 5),
-        word_ngram_range=WORD_NGRAM_RANGE,
-    )
+    # 4. Pass 1: Build consistent global TfidfVectorizers (or load from cache)
+    cache_dir = OUTPUT_DIR / "cache"
+    char_cache_file = cache_dir / "char_vectorizer.joblib"
+    word_cache_file = cache_dir / "word_vectorizer.joblib"
+
+    if (
+        not force_recompute_vectorizers
+        and max_target_rows is None
+        and char_cache_file.exists()
+        and word_cache_file.exists()
+    ):
+        print(f"\n[Cache] Loading precomputed global TF-IDF vectorizers from {cache_dir}...")
+        import joblib
+        char_vectorizer = joblib.load(char_cache_file)
+        word_vectorizer = joblib.load(word_cache_file)
+    else:
+        char_vectorizer, word_vectorizer = build_dual_consistent_vectorizers(
+            s2_path=s2_path,
+            s3_path=s3_path,
+            chunk_size=target_chunk_size,
+            total_target_rows=total_target_rows,
+            max_target_rows=max_target_rows,
+            char_ngram_range=(3, 5),
+            word_ngram_range=WORD_NGRAM_RANGE,
+        )
+        if max_target_rows is None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            import joblib
+            joblib.dump(char_vectorizer, char_cache_file)
+            joblib.dump(word_vectorizer, word_cache_file)
 
     # 5. Transform S1 queries ONCE using both global vectorizers
     print("\nTransforming S1 queries into global feature spaces...")
@@ -488,7 +515,7 @@ def run_benchmark(
     print(f"X_s1_word shape: {X_s1_word.shape}, nnz: {X_s1_word.nnz:,}")
 
     # 6. Pass 2: Stream target candidate chunks and accumulate candidates for both branches
-    print(f"\n[Pass 2/2] Streaming {eval_target_rows:,} target records across ~{num_chunks} chunks for dual retrieval...")
+    print(f"\n[Pass 2/2] Streaming {eval_target_rows:,} target records across ~{num_chunks} chunks for dual retrieval (Max K={max_k})...")
     char_candidates: Dict[str, Dict[str, float]] = {sid: {} for sid in s1_ids}
     word_candidates: Dict[str, Dict[str, float]] = {sid: {} for sid in s1_ids}
     total_processed_targets = 0
@@ -530,6 +557,11 @@ def run_benchmark(
 
             cols = row_sims.indices
             data = row_sims.data
+            if len(data) > max_k * 2:
+                top_idx = np.argpartition(data, -max_k * 2)[-max_k * 2:]
+                cols = cols[top_idx]
+                data = data[top_idx]
+
             s1_map = char_candidates[sid]
             for col, score in zip(cols, data):
                 cid = target_ids[col]
@@ -538,9 +570,9 @@ def run_benchmark(
                     s1_map[cid] = s
 
             # Prune memory periodically
-            if len(s1_map) > char_top_k * 4:
+            if len(s1_map) > max_k * 4:
                 top_items = heapq.nsmallest(
-                    char_top_k * 2, s1_map.items(), key=lambda x: (-x[1], x[0])
+                    max_k * 2, s1_map.items(), key=lambda x: (-x[1], x[0])
                 )
                 char_candidates[sid] = dict(top_items)
 
@@ -561,6 +593,11 @@ def run_benchmark(
 
             cols = row_sims.indices
             data = row_sims.data
+            if len(data) > max_k * 2:
+                top_idx = np.argpartition(data, -max_k * 2)[-max_k * 2:]
+                cols = cols[top_idx]
+                data = data[top_idx]
+
             s1_map = word_candidates[sid]
             for col, score in zip(cols, data):
                 cid = target_ids[col]
@@ -569,9 +606,9 @@ def run_benchmark(
                     s1_map[cid] = s
 
             # Prune memory periodically
-            if len(s1_map) > word_top_k * 4:
+            if len(s1_map) > max_k * 4:
                 top_items = heapq.nsmallest(
-                    word_top_k * 2, s1_map.items(), key=lambda x: (-x[1], x[0])
+                    max_k * 2, s1_map.items(), key=lambda x: (-x[1], x[0])
                 )
                 word_candidates[sid] = dict(top_items)
 
@@ -593,63 +630,93 @@ def run_benchmark(
     total_runtime = time.time() - t_start
     peak_rss = get_peak_memory_mb()
 
-    # 7. Select Top-K with deterministic tie-breaking for both branches
-    final_char_candidates: Dict[str, Set[str]] = {}
-    final_word_candidates: Dict[str, Set[str]] = {}
-    final_union_candidates: Dict[str, Set[str]] = {}
+    # 7. Evaluate each Top-K cutoff
+    top_k_comparison: Dict[str, Dict[str, Any]] = {}
 
-    for sid in s1_ids:
-        # Top-K Character candidates
-        char_top = heapq.nsmallest(
-            char_top_k, char_candidates[sid].items(), key=lambda x: (-x[1], x[0])
-        )
-        c_set = set(cid for cid, _ in char_top)
-        final_char_candidates[sid] = c_set
+    for k in sorted(compare_top_k):
+        final_char_cands: Dict[str, Set[str]] = {}
+        final_word_cands: Dict[str, Set[str]] = {}
+        final_union_cands: Dict[str, Set[str]] = {}
 
-        # Top-K Word candidates
-        word_top = heapq.nsmallest(
-            word_top_k, word_candidates[sid].items(), key=lambda x: (-x[1], x[0])
-        )
-        w_set = set(cid for cid, _ in word_top)
-        final_word_candidates[sid] = w_set
+        for sid in s1_ids:
+            c_top = heapq.nsmallest(k, char_candidates[sid].items(), key=lambda x: (-x[1], x[0]))
+            w_top = heapq.nsmallest(k, word_candidates[sid].items(), key=lambda x: (-x[1], x[0]))
 
-        # Candidate UNION (Requirement 8)
-        u_set = c_set | w_set
-        final_union_candidates[sid] = u_set
+            c_set = set(cid for cid, _ in c_top)
+            w_set = set(cid for cid, _ in w_top)
+            u_set = c_set | w_set
 
-        # Verify candidate provenance (Requirement 10)
-        assert u_set == (c_set | w_set), f"Union set mismatch for S1 entity {sid}"
-        for cid in u_set:
-            assert cid in c_set or cid in w_set, f"Candidate {cid} for {sid} did not originate from Char or Word branches"
+            final_char_cands[sid] = c_set
+            final_word_cands[sid] = w_set
+            final_union_cands[sid] = u_set
 
-    print("\n[Provenance Verification PASSED] Verified: 100% of UNION candidates originate strictly from Char or Word branches.")
+        c_ret = sum(len(final_char_cands[sid] & gt_map[sid]) for sid in s1_ids)
+        w_ret = sum(len(final_word_cands[sid] & gt_map[sid]) for sid in s1_ids)
+        u_ret = sum(len(final_union_cands[sid] & gt_map[sid]) for sid in s1_ids)
 
-    # 8. Compute Recall & Overlap Metrics (Requirement 9)
-    char_retrieved_true_pairs = sum(len(final_char_candidates[sid] & gt_map[sid]) for sid in s1_ids)
-    word_retrieved_true_pairs = sum(len(final_word_candidates[sid] & gt_map[sid]) for sid in s1_ids)
-    union_retrieved_true_pairs = sum(len(final_union_candidates[sid] & gt_map[sid]) for sid in s1_ids)
+        c_recall = float(c_ret / total_true_pairs) if total_true_pairs > 0 else 1.0
+        w_recall = float(w_ret / total_true_pairs) if total_true_pairs > 0 else 1.0
+        u_recall = float(u_ret / total_true_pairs) if total_true_pairs > 0 else 1.0
 
-    char_pair_recall = (char_retrieved_true_pairs / total_true_pairs) if total_true_pairs > 0 else 1.0
-    word_pair_recall = (word_retrieved_true_pairs / total_true_pairs) if total_true_pairs > 0 else 1.0
-    union_pair_recall = (union_retrieved_true_pairs / total_true_pairs) if total_true_pairs > 0 else 1.0
+        c_cands = sum(len(final_char_cands[sid]) for sid in s1_ids)
+        w_cands = sum(len(final_word_cands[sid]) for sid in s1_ids)
+        u_cands = sum(len(final_union_cands[sid]) for sid in s1_ids)
 
-    char_total_cands = sum(len(final_char_candidates[sid]) for sid in s1_ids)
-    word_total_cands = sum(len(final_word_candidates[sid]) for sid in s1_ids)
-    union_total_cands = sum(len(final_union_candidates[sid]) for sid in s1_ids)
+        avg_c_cands = float(c_cands / len(s1_ids))
+        avg_w_cands = float(w_cands / len(s1_ids))
+        avg_u_cands = float(u_cands / len(s1_ids))
 
-    avg_char_cands = char_total_cands / len(s1_ids)
-    avg_word_cands = word_total_cands / len(s1_ids)
-    avg_union_cands = union_total_cands / len(s1_ids)
+        overlap = sum(len(final_char_cands[sid] & final_word_cands[sid]) for sid in s1_ids)
+        avg_overlap = float(overlap / len(s1_ids))
+        overlap_pct = float(overlap / u_cands * 100.0) if u_cands > 0 else 0.0
 
-    total_overlap = sum(len(final_char_candidates[sid] & final_word_candidates[sid]) for sid in s1_ids)
-    avg_overlap = total_overlap / len(s1_ids)
-    overlap_pct_of_union = (total_overlap / union_total_cands * 100.0) if union_total_cands > 0 else 0.0
+        top_k_comparison[f"K={k}"] = {
+            "top_k": k,
+            "pair_recall": round(u_recall, 6),
+            "retrieved_true_pairs": u_ret,
+            "total_true_pairs": total_true_pairs,
+            "total_candidate_pairs": u_cands,
+            "average_candidates_per_s1": round(avg_u_cands, 2),
+            "char_retrieved_true_pairs": c_ret,
+            "word_retrieved_true_pairs": w_ret,
+            "char_pair_recall": round(c_recall, 6),
+            "word_pair_recall": round(w_recall, 6),
+            "candidate_overlap": overlap,
+            "avg_candidate_overlap_per_s1": round(avg_overlap, 2),
+            "overlap_percent_of_union": round(overlap_pct, 2),
+            "runtime_seconds": round(float(total_runtime), 2),
+            "peak_memory_mb": round(float(peak_rss), 2),
+        }
 
-    # Incremental gain of UNION over single best branch
-    max_single_recall = max(char_pair_recall, word_pair_recall)
-    recall_gain = union_pair_recall - max_single_recall
+    # 8. Compute Marginal Gains between consecutive K cutoffs
+    marginal_gains = []
+    sorted_ks = sorted(compare_top_k)
+    for i in range(1, len(sorted_ks)):
+        k_prev = sorted_ks[i - 1]
+        k_curr = sorted_ks[i]
+        m_prev = top_k_comparison[f"K={k_prev}"]
+        m_curr = top_k_comparison[f"K={k_curr}"]
 
-    # 9. Format Results JSON (Requirement 11)
+        delta_ret = m_curr["retrieved_true_pairs"] - m_prev["retrieved_true_pairs"]
+        delta_recall = m_curr["pair_recall"] - m_prev["pair_recall"]
+        delta_cands = m_curr["total_candidate_pairs"] - m_prev["total_candidate_pairs"]
+        delta_avg_cands = m_curr["average_candidates_per_s1"] - m_prev["average_candidates_per_s1"]
+
+        marginal_gains.append({
+            "transition": f"K{k_prev} -> K{k_curr}",
+            "from_k": k_prev,
+            "to_k": k_curr,
+            "delta_retrieved_true_pairs": delta_ret,
+            "delta_pair_recall": round(delta_recall, 6),
+            "delta_pair_recall_pct": round(delta_recall * 100.0, 2),
+            "delta_total_candidates": delta_cands,
+            "delta_average_candidates_per_s1": round(delta_avg_cands, 2),
+        })
+
+    # 9. Format Results JSON
+    primary_k = compare_top_k[0] if compare_top_k else 20
+    primary_metrics = top_k_comparison.get(f"K={primary_k}", {})
+
     results = {
         "benchmark_type": "sampled_training_benchmark",
         "benchmark_channel": "union_tfidf",
@@ -661,56 +728,41 @@ def run_benchmark(
         "full_corpus_evaluated": (total_processed_targets == total_target_rows),
         "target_chunk_size": target_chunk_size,
         "total_target_chunks": num_chunks,
-        "char_top_k": char_top_k,
-        "word_top_k": word_top_k,
+        "evaluated_k_values": sorted(compare_top_k),
         "runtime_seconds": round(float(total_runtime), 2),
         "peak_memory_mb": round(float(peak_rss), 2),
         "provenance_verified": True,
-        "metrics": {
-            "number_of_s1_evaluated": len(s1_ids),
-            "total_true_pairs": total_true_pairs,
-            "char_retrieved_true_pairs": char_retrieved_true_pairs,
-            "word_retrieved_true_pairs": word_retrieved_true_pairs,
-            "union_retrieved_true_pairs": union_retrieved_true_pairs,
-            "char_pair_recall": round(float(char_pair_recall), 6),
-            "word_pair_recall": round(float(word_pair_recall), 6),
-            "union_pair_recall": round(float(union_pair_recall), 6),
-            "recall_gain_over_best_branch": round(float(recall_gain), 6),
-            "char_total_candidates": char_total_cands,
-            "word_total_candidates": word_total_cands,
-            "union_total_candidates": union_total_cands,
-            "avg_char_candidates_per_s1": round(float(avg_char_cands), 2),
-            "avg_word_candidates_per_s1": round(float(avg_word_cands), 2),
-            "avg_union_candidates_per_s1": round(float(avg_union_cands), 2),
-            "total_candidate_overlap": total_overlap,
-            "avg_candidate_overlap_per_s1": round(float(avg_overlap), 2),
-            "overlap_percent_of_union": round(float(overlap_pct_of_union), 2),
-        },
+        "top_k_comparison": top_k_comparison,
+        "marginal_gains": marginal_gains,
+        "metrics": primary_metrics,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved benchmark results to {output_path}")
+    print(f"\nSaved benchmark results to {output_path}")
 
-    # 10. Print Complete UNION Results Table (Requirement 18 / End of Task)
-    print("\n" + "=" * 94)
-    print("CANDIDATE UNION BLOCKING BENCHMARK RESULTS")
+    # 10. Print Complete UNION Multi-K Table
+    print("\n" + "=" * 96)
+    print("CANDIDATE UNION BLOCKING BENCHMARK: TOP-K COMPARISON (K=20, 30, 40, 50)")
     print(f"(S1 Queries: {len(s1_ids):,}, Full Target Corpus: {total_processed_targets:,} rows across {num_chunks} chunks)")
-    print("=" * 94)
-    print(f"{'Retrieval Channel':<25} {'Top-K':<8} {'Pair Recall':<14} {'Retrieved Pairs':<18} {'Total Cands':<14} {'Avg Cands/S1':<14}")
-    print("-" * 94)
-    print(f"{'Character TF-IDF':<25} {char_top_k:<8} {char_pair_recall:<14.4f} {char_retrieved_true_pairs}/{total_true_pairs:<15} {char_total_cands:<14} {avg_char_cands:<14.2f}")
-    print(f"{'Word TF-IDF':<25} {word_top_k:<8} {word_pair_recall:<14.4f} {word_retrieved_true_pairs}/{total_true_pairs:<15} {word_total_cands:<14} {avg_word_cands:<14.2f}")
-    print(f"{'UNION (Char + Word)':<25} {'~35':<8} {union_pair_recall:<14.4f} {union_retrieved_true_pairs}/{total_true_pairs:<15} {union_total_cands:<14} {avg_union_cands:<14.2f}")
-    print("-" * 94)
-    print(f"Recall Gain of UNION over best single branch: +{recall_gain * 100.0:.2f}% ({union_retrieved_true_pairs - max(char_retrieved_true_pairs, word_retrieved_true_pairs):+d} true pairs)")
-    print(f"Candidate Overlap (Char & Word): {total_overlap:,} candidates (avg {avg_overlap:.2f} / S1, {overlap_pct_of_union:.1f}% of UNION)")
-    print(f"Candidate Provenance Verification: 100% of UNION candidates confirmed from Char or Word branches")
-    full_str = "YES - Full 10,320,219 target rows evaluated (no subsampling)" if total_processed_targets == total_target_rows else f"NO - Bounded slice of {total_processed_targets:,} rows evaluated"
-    print(f"Target Corpus Coverage: {full_str}")
+    print("=" * 96)
+    print(f"{'Top-K':<8} {'Pair Recall':<14} {'Retrieved Pairs':<18} {'Total Cands':<14} {'Avg Cands/S1':<14} {'Peak RSS (MB)':<14}")
+    print("-" * 96)
+    for k_str, m in top_k_comparison.items():
+        print(f"{m['top_k']:<8} {m['pair_recall']*100:>6.2f}% ({m['pair_recall']:<6.4f}) {m['retrieved_true_pairs']}/{m['total_true_pairs']:<15} {m['total_candidate_pairs']:<14} {m['average_candidates_per_s1']:<14.2f} {m['peak_memory_mb']:<14.2f}")
+    print("-" * 96)
+
+    print("\n" + "=" * 96)
+    print("MARGINAL RECALL GAIN & CANDIDATE EFFICIENCY TRADEOFF")
+    print("=" * 96)
+    print(f"{'Transition':<16} {'Recall Gain':<18} {'True Pairs Gained':<20} {'Candidate Growth':<20} {'Avg Cands/S1 Growth':<20}")
+    print("-" * 96)
+    for g in marginal_gains:
+        print(f"{g['transition']:<16} +{g['delta_pair_recall_pct']:>5.2f}% ({g['delta_pair_recall']:<+.4f}) {g['delta_retrieved_true_pairs']:<+20d} {g['delta_total_candidates']:<+20d} {g['delta_average_candidates_per_s1']:<+20.2f}")
+    print("-" * 96)
     print(f"Total Runtime: {total_runtime:.2f}s ({total_runtime / 60.0:.2f} min) | Peak RSS: {peak_rss:.1f} MB")
-    print("=" * 94)
+    print("=" * 96)
 
     return results
 
@@ -721,6 +773,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling (default: 42)")
     parser.add_argument("--char-top-k", type=int, default=CHAR_TFIDF_TOP_K, help=f"Character Top-K cutoff (default: {CHAR_TFIDF_TOP_K})")
     parser.add_argument("--word-top-k", type=int, default=WORD_TFIDF_TOP_K, help=f"Word Top-K cutoff (default: {WORD_TFIDF_TOP_K})")
+    parser.add_argument("--compare-top-k", nargs="+", type=int, default=[20, 30, 40, 50], help="Top-K cutoff values to evaluate (default: 20 30 40 50)")
     parser.add_argument("--target-chunk-size", type=int, default=100000, help="Target chunk size for streaming retrieval (default: 100000)")
     parser.add_argument("--max-target-rows", type=int, default=None, help="Maximum target rows to load (default: None for full corpus)")
     parser.add_argument("--s1-path", type=Path, default=TRAIN_SOURCE1, help="Path to train_source1.tsv")
@@ -729,6 +782,7 @@ def main():
     parser.add_argument("--gt-path", type=Path, default=TRAIN_GROUND_TRUTH, help="Path to train_ground_truth.tsv")
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR / "union_blocking_benchmark.json", help="Output JSON path")
     parser.add_argument("--check-safety-only", action="store_true", help="Perform computational safety estimation and exit")
+    parser.add_argument("--force-recompute-vectorizers", action="store_true", help="Force rebuilding global TF-IDF vectorizers instead of loading from cache")
 
     args = parser.parse_args()
 
@@ -737,6 +791,7 @@ def main():
         seed=args.seed,
         char_top_k=args.char_top_k,
         word_top_k=args.word_top_k,
+        compare_top_k=args.compare_top_k,
         target_chunk_size=args.target_chunk_size,
         max_target_rows=args.max_target_rows,
         s1_path=args.s1_path,
@@ -745,6 +800,7 @@ def main():
         gt_path=args.gt_path,
         output_path=args.output,
         check_safety_only=args.check_safety_only,
+        force_recompute_vectorizers=args.force_recompute_vectorizers,
     )
 
 

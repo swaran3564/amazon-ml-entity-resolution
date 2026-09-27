@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
 
+# Sentinel empty dict for safe .get() without allocation
+_EMPTY_DICT: Dict = {}
+
 from src.preprocess import (
     compact_address,
     compact_name,
@@ -529,5 +532,180 @@ def build_feature_matrix(
     for c in FEATURE_COLUMNS:
         if c in df.columns:
             df[c] = df[c].astype(np.float32)
+
+    return df
+
+
+def build_feature_matrix_v2(
+    s1_ids_list: List[str],
+    cand_ids_list: List[str],
+    char_sims: np.ndarray,
+    word_sims: np.ndarray,
+    s1_dict: Dict[str, dict],
+    target_dict: Dict[str, dict],
+) -> pd.DataFrame:
+    """Vectorized feature matrix construction using pre-normalised attribute dicts.
+
+    Semantics are identical to build_feature_matrix / extract_pair_features but
+    avoids per-pair Python overhead:
+    - No per-pair dict creation or pd.isna() calls.
+    - Two attribute-extraction passes over N pairs (one for S1, one for targets).
+    - DataFrame built from column arrays (not from list-of-row-dicts).
+
+    Requires s1_dict and target_dict to carry pre-normalised keys:
+        name_normalized, name_compact,
+        address_normalized, address_compact,
+        address_numeric_tokens  (list[str] or []),
+        country_norm_lc         (casefolded str, '' if missing)
+
+    Falls back gracefully to empty strings / empty lists for any missing key.
+    """
+    N = len(s1_ids_list)
+    if N == 0:
+        empty_cols = ["source1_entity_id", "matched_entity_id"] + FEATURE_COLUMNS
+        return pd.DataFrame(columns=empty_cols)
+
+    # ── Attribute extraction (two list-level passes, no pd.isna) ─────────────
+    n1: List[str] = [''] * N
+    nc1: List[str] = [''] * N
+    a1: List[str] = [''] * N
+    ac1: List[str] = [''] * N
+    nums1: List[list] = [_EMPTY_DICT] * N  # reused sentinel; replaced below
+    c1: List[str] = [''] * N
+
+    n2: List[str] = [''] * N
+    nc2: List[str] = [''] * N
+    a2: List[str] = [''] * N
+    ac2: List[str] = [''] * N
+    nums2: List[list] = [_EMPTY_DICT] * N
+    c2: List[str] = [''] * N
+
+    for i in range(N):
+        sr = s1_dict.get(s1_ids_list[i], _EMPTY_DICT)
+        tr = target_dict.get(cand_ids_list[i], _EMPTY_DICT)
+
+        n1[i] = sr.get('name_normalized') or ''
+        nc1[i] = sr.get('name_compact') or ''
+        a1[i] = sr.get('address_normalized') or ''
+        ac1[i] = sr.get('address_compact') or ''
+        nums1[i] = sr.get('address_numeric_tokens') or []
+        c1[i] = sr.get('country_norm_lc') or ''
+
+        n2[i] = tr.get('name_normalized') or ''
+        nc2[i] = tr.get('name_compact') or ''
+        a2[i] = tr.get('address_normalized') or ''
+        ac2[i] = tr.get('address_compact') or ''
+        nums2[i] = tr.get('address_numeric_tokens') or []
+        c2[i] = tr.get('country_norm_lc') or ''
+
+    # ── Name features ─────────────────────────────────────────────────────────
+    name_exact = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        name_exact[i] = 1.0 if (n1[i] and n2[i] and n1[i] == n2[i]) else 0.0
+
+    name_compact_exact = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        name_compact_exact[i] = 1.0 if (nc1[i] and nc2[i] and nc1[i] == nc2[i]) else 0.0
+
+    # Use precomputed retrieval score when > 0; otherwise compute n-gram similarity
+    cs = np.asarray(char_sims, dtype=np.float32).copy()
+    ws = np.asarray(word_sims, dtype=np.float32).copy()
+    for i in range(N):
+        if cs[i] == 0.0:
+            cs[i] = 1.0 if name_exact[i] else _char_ngram_similarity(n1[i], n2[i])
+        if ws[i] == 0.0:
+            ws[i] = 1.0 if name_exact[i] else _word_ngram_similarity(n1[i], n2[i])
+
+    name_toks1 = [x.split() for x in n1]
+    name_toks2 = [x.split() for x in n2]
+    name_token_overlap = np.empty(N, dtype=np.float32)
+    name_token_dice_arr = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        name_token_overlap[i] = _token_jaccard(name_toks1[i], name_toks2[i])
+        name_token_dice_arr[i] = _token_dice(name_toks1[i], name_toks2[i])
+
+    l_n1 = np.array([len(x) for x in n1], dtype=np.float32)
+    l_n2 = np.array([len(x) for x in n2], dtype=np.float32)
+    name_len_diff = np.abs(l_n1 - l_n2)
+    mx_n = np.maximum(l_n1, l_n2)
+    name_len_ratio = np.where(mx_n > 0, np.minimum(l_n1, l_n2) / mx_n, 0.0).astype(np.float32)
+    name_has_missing = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        name_has_missing[i] = 0.0 if (n1[i] and n2[i]) else 1.0
+
+    # ── Address features ──────────────────────────────────────────────────────
+    addr_exact = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        addr_exact[i] = 1.0 if (a1[i] and a2[i] and a1[i] == a2[i]) else 0.0
+
+    addr_compact_exact = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        addr_compact_exact[i] = 1.0 if (ac1[i] and ac2[i] and ac1[i] == ac2[i]) else 0.0
+
+    addr_string_sim = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        addr_string_sim[i] = 1.0 if addr_exact[i] else _char_ngram_similarity(a1[i], a2[i])
+
+    addr_toks1 = [x.split() for x in a1]
+    addr_toks2 = [x.split() for x in a2]
+    addr_token_overlap = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        addr_token_overlap[i] = _token_jaccard(addr_toks1[i], addr_toks2[i])
+
+    addr_numeric_overlap = np.empty(N, dtype=np.float32)
+    addr_numeric_exact = np.empty(N, dtype=np.float32)
+    addr_numeric_mismatch = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        jac, exc, mis = _numeric_token_overlap(nums1[i], nums2[i])
+        addr_numeric_overlap[i] = jac
+        addr_numeric_exact[i] = exc
+        addr_numeric_mismatch[i] = mis
+
+    l_a1 = np.array([len(x) for x in a1], dtype=np.float32)
+    l_a2 = np.array([len(x) for x in a2], dtype=np.float32)
+    addr_len_diff = np.abs(l_a1 - l_a2)
+    addr_has_missing = np.empty(N, dtype=np.float32)
+    for i in range(N):
+        addr_has_missing[i] = 0.0 if (a1[i] and a2[i]) else 1.0
+
+    # ── Country features ──────────────────────────────────────────────────────
+    country_exact = np.zeros(N, dtype=np.float32)
+    country_mismatch = np.zeros(N, dtype=np.float32)
+    country_has_missing = np.ones(N, dtype=np.float32)
+    for i in range(N):
+        if c1[i] and c2[i]:
+            country_has_missing[i] = 0.0
+            if c1[i] == c2[i]:
+                country_exact[i] = 1.0
+            else:
+                country_mismatch[i] = 1.0
+
+    # ── Build DataFrame from column arrays (no row-dict intermediate) ─────────
+    df = pd.DataFrame({
+        "source1_entity_id": s1_ids_list,
+        "matched_entity_id": cand_ids_list,
+        "name_exact_match": name_exact,
+        "name_compact_exact_match": name_compact_exact,
+        "name_char_tfidf_sim": cs,
+        "name_word_tfidf_sim": ws,
+        "name_token_overlap": name_token_overlap,
+        "name_token_dice": name_token_dice_arr,
+        "name_len_diff": name_len_diff,
+        "name_len_ratio": name_len_ratio,
+        "name_has_missing": name_has_missing,
+        "address_exact_match": addr_exact,
+        "address_compact_exact_match": addr_compact_exact,
+        "address_string_sim": addr_string_sim,
+        "address_token_overlap": addr_token_overlap,
+        "address_numeric_overlap": addr_numeric_overlap,
+        "address_numeric_exact_match": addr_numeric_exact,
+        "address_numeric_mismatch": addr_numeric_mismatch,
+        "address_len_diff": addr_len_diff,
+        "address_has_missing": addr_has_missing,
+        "country_exact_match": country_exact,
+        "country_mismatch": country_mismatch,
+        "country_has_missing": country_has_missing,
+        "emb_sim": np.zeros(N, dtype=np.float32),
+    })
 
     return df

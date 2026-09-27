@@ -28,18 +28,23 @@ from typing import Optional
 
 
 def run_pipeline(
-    train_mode: bool = True,
+    train_mode: bool = False,
     config_override: Optional[dict] = None
-) -> None:
+) -> dict:
     """Run the complete Business Entity Resolution pipeline.
-    
+
     Generates:
     - output/candidate_pairs.tsv (blocking candidates fed to model)
     - output/matching_results.tsv (final match predictions)
-    
-    To be implemented during pipeline development.
     """
-    raise NotImplementedError("To be implemented during pipeline development.")
+    if train_mode:
+        from scripts.train_matcher import train_matcher
+        override = config_override or {}
+        return train_matcher(**override)
+    else:
+        from scripts.run_test_inference import run_test_inference
+        override = config_override or {}
+        return run_test_inference(**override)
 
 
 if __name__ == "__main__":
